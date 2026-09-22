@@ -110,7 +110,7 @@ function buildBezierLoop(anchorPoints, samplesPerSegment = 48) {
     const tangentX = next.x - previous.x
     const tangentY = next.y - previous.y
     const tangentLength = Math.max(Math.hypot(tangentX, tangentY), 1)
-    const handleLength = Math.min(distanceBetween(previous, anchor), distanceBetween(anchor, next)) * 0.16
+    const handleLength = Math.min(distanceBetween(previous, anchor), distanceBetween(anchor, next)) * 0.26
     const directionX = tangentX / tangentLength
     const directionY = tangentY / tangentLength
 
@@ -307,6 +307,27 @@ function getRadarDetection(points, position, heading, radarLength, radarHalfAngl
   return { left, right }
 }
 
+function getClearanceSteeringBias(points, position, heading, lookaheadDistance, lateralOffset) {
+  const directionX = Math.cos(heading)
+  const directionY = Math.sin(heading)
+  const leftNormalX = Math.sin(heading)
+  const leftNormalY = -Math.cos(heading)
+  const rightNormalX = -leftNormalX
+  const rightNormalY = -leftNormalY
+  const forwardX = position.x + directionX * lookaheadDistance
+  const forwardY = position.y + directionY * lookaheadDistance
+  const leftClearance = getDistanceToTrack(points, {
+    x: forwardX + leftNormalX * lateralOffset,
+    y: forwardY + leftNormalY * lateralOffset,
+  })
+  const rightClearance = getDistanceToTrack(points, {
+    x: forwardX + rightNormalX * lateralOffset,
+    y: forwardY + rightNormalY * lateralOffset,
+  })
+
+  return Phaser.Math.Clamp((leftClearance - rightClearance) / lateralOffset, -1, 1)
+}
+
 function formatSeed(seed) {
   return seed.toString(16).toUpperCase().padStart(6, '0')
 }
@@ -332,7 +353,10 @@ function generateTrack(seed = Math.floor(Math.random() * 0xffffff)) {
     for (let index = 0; index < 8; index += 1) {
       const sectorStart = -Math.PI / 2 + index * TAU / 8
       const angle = sectorStart + 0.12 + random() * 0.54
-      const radius = 0.74 + random() * 0.16
+      const isInnerAnchor = index % 2 === 0
+      const radius = isInnerAnchor
+        ? 0.52 + random() * 0.1
+        : 0.84 + random() * 0.12
       candidateAnchors.push({
         x: center.x + Math.cos(angle) * radius * WORLD_WIDTH * 0.43,
         y: center.y + Math.sin(angle) * radius * WORLD_HEIGHT * 0.43,
@@ -351,7 +375,7 @@ function generateTrack(seed = Math.floor(Math.random() * 0xffffff)) {
   if (!points) {
     anchorPoints = Array.from({ length: 8 }, (_, index) => {
       const angle = -Math.PI / 2 + (index + 0.5) * TAU / 8
-      const radius = 0.8
+      const radius = index % 2 === 0 ? 0.58 : 0.9
       return {
         x: center.x + Math.cos(angle) * radius * WORLD_WIDTH * 0.43,
         y: center.y + Math.sin(angle) * radius * WORLD_HEIGHT * 0.43,
@@ -405,6 +429,7 @@ class RaceTrackScene extends Phaser.Scene {
     this.radarHalfAngle = 0.72
     this.radarSteeringRate = 0.0015
     this.radarSteering = 0
+    this.radarEscapeDirection = 1
     this.laserGraphics = null
     this.radarGraphics = null
   }
@@ -420,9 +445,9 @@ class RaceTrackScene extends Phaser.Scene {
   update(_time, delta) {
     if (!this.track || !this.racer || this.carCrashed) return
 
-    const radarDetection = this.getRadarDetection()
-    this.updateSteering(radarDetection, delta)
     const wallDetection = this.getWallDetection()
+    const radarDetection = this.getRadarDetection()
+    this.updateSteering(radarDetection, wallDetection, delta)
     const safeSpeed = this.getSafeSpeed(wallDetection)
     const isBraking = this.driveSpeed > safeSpeed
     const responseRate = isBraking
@@ -627,14 +652,32 @@ class RaceTrackScene extends Phaser.Scene {
     )
   }
 
-  updateSteering(radarDetection, delta) {
+  updateSteering(radarDetection, wallDetection, delta) {
     const leftDanger = radarDetection.left
       ? Phaser.Math.Clamp(1 - radarDetection.left.distance / this.radarLength, 0, 1)
       : 0
     const rightDanger = radarDetection.right
       ? Phaser.Math.Clamp(1 - radarDetection.right.distance / this.radarLength, 0, 1)
       : 0
-    const steeringBias = Phaser.Math.Clamp((leftDanger - rightDanger) * 1.8, -1, 1)
+    let steeringBias = Phaser.Math.Clamp((leftDanger - rightDanger) * 1.8, -1, 1)
+    const sameWallAhead = wallDetection
+      && radarDetection.left
+      && radarDetection.right
+      && Math.abs(radarDetection.left.distance - radarDetection.right.distance) < 24
+
+    if (sameWallAhead) {
+      const clearanceBias = getClearanceSteeringBias(
+        this.track.points,
+        this.racer,
+        this.racerHeading,
+        Math.min(wallDetection.distance + 90, this.radarLength),
+        this.roadWidth * 1.2,
+      )
+      this.radarEscapeDirection = Math.abs(clearanceBias) > 0.15
+        ? Math.sign(clearanceBias)
+        : this.radarEscapeDirection
+      steeringBias = this.radarEscapeDirection * Math.max(Math.abs(steeringBias), 0.7)
+    }
     const steeringDirectionChanged = steeringBias !== 0
       && this.radarSteering !== 0
       && Math.sign(steeringBias) !== Math.sign(this.radarSteering)
