@@ -36,7 +36,7 @@ app.innerHTML = `
           <p class="readout-caption">procedural route signature</p>
         </div>
         <div class="readout-grid">
-          <div class="metric"><span class="metric-label">TURNS</span><strong id="turn-count">--</strong></div>
+          <div class="metric"><span class="metric-label">ANCHORS</span><strong id="anchor-count">--</strong></div>
           <div class="metric"><span class="metric-label">LENGTH</span><strong id="track-length">--</strong><small>M</small></div>
           <div class="metric"><span class="metric-label">WIDTH</span><strong>08</strong><small>M</small></div>
           <div class="metric"><span class="metric-label">SURFACE</span><strong>DRY</strong></div>
@@ -86,27 +86,58 @@ function createRandom(seed = Math.floor(Math.random() * 0xffffff)) {
   }
 }
 
-function interpolateCatmullRom(p0, p1, p2, p3, amount) {
+function cubicBezier(first, controlFirst, controlSecond, last, amount) {
+  const inverseAmount = 1 - amount
+  const inverseSquared = inverseAmount * inverseAmount
   const amountSquared = amount * amount
-  const amountCubed = amountSquared * amount
 
   return {
-    x: 0.5 * ((2 * p1.x) + (-p0.x + p2.x) * amount + (2 * p0.x - 5 * p1.x + 4 * p2.x - p3.x) * amountSquared + (-p0.x + 3 * p1.x - 3 * p2.x + p3.x) * amountCubed),
-    y: 0.5 * ((2 * p1.y) + (-p0.y + p2.y) * amount + (2 * p0.y - 5 * p1.y + 4 * p2.y - p3.y) * amountSquared + (-p0.y + 3 * p1.y - 3 * p2.y + p3.y) * amountCubed),
+    x: inverseSquared * inverseAmount * first.x
+      + 3 * inverseSquared * amount * controlFirst.x
+      + 3 * inverseAmount * amountSquared * controlSecond.x
+      + amountSquared * amount * last.x,
+    y: inverseSquared * inverseAmount * first.y
+      + 3 * inverseSquared * amount * controlFirst.y
+      + 3 * inverseAmount * amountSquared * controlSecond.y
+      + amountSquared * amount * last.y,
   }
 }
 
-function smoothLoop(controlPoints, samplesPerSegment = 24) {
+function buildBezierLoop(anchorPoints, samplesPerSegment = 48) {
+  const handles = anchorPoints.map((anchor, index) => {
+    const previous = anchorPoints[(index - 1 + anchorPoints.length) % anchorPoints.length]
+    const next = anchorPoints[(index + 1) % anchorPoints.length]
+    const tangentX = next.x - previous.x
+    const tangentY = next.y - previous.y
+    const tangentLength = Math.max(Math.hypot(tangentX, tangentY), 1)
+    const handleLength = Math.min(distanceBetween(previous, anchor), distanceBetween(anchor, next)) * 0.16
+    const directionX = tangentX / tangentLength
+    const directionY = tangentY / tangentLength
+
+    return {
+      outgoing: {
+        x: anchor.x + directionX * handleLength,
+        y: anchor.y + directionY * handleLength,
+      },
+      incoming: {
+        x: anchor.x - directionX * handleLength,
+        y: anchor.y - directionY * handleLength,
+      },
+    }
+  })
   const points = []
 
-  for (let index = 0; index < controlPoints.length; index += 1) {
-    const p0 = controlPoints[(index - 1 + controlPoints.length) % controlPoints.length]
-    const p1 = controlPoints[index]
-    const p2 = controlPoints[(index + 1) % controlPoints.length]
-    const p3 = controlPoints[(index + 2) % controlPoints.length]
+  for (let index = 0; index < anchorPoints.length; index += 1) {
+    const nextIndex = (index + 1) % anchorPoints.length
 
     for (let step = 0; step < samplesPerSegment; step += 1) {
-      points.push(interpolateCatmullRom(p0, p1, p2, p3, step / samplesPerSegment))
+      points.push(cubicBezier(
+        anchorPoints[index],
+        handles[index].outgoing,
+        handles[nextIndex].incoming,
+        anchorPoints[nextIndex],
+        step / samplesPerSegment,
+      ))
     }
   }
 
@@ -150,6 +181,59 @@ function getDistanceToTrack(points, position) {
   }
 
   return nearestDistance
+}
+
+function getCrossProduct(first, second, third) {
+  return (second.x - first.x) * (third.y - first.y) - (second.y - first.y) * (third.x - first.x)
+}
+
+function isPointOnSegment(point, start, end) {
+  const epsilon = 0.001
+  return point.x >= Math.min(start.x, end.x) - epsilon
+    && point.x <= Math.max(start.x, end.x) + epsilon
+    && point.y >= Math.min(start.y, end.y) - epsilon
+    && point.y <= Math.max(start.y, end.y) + epsilon
+}
+
+function doSegmentsIntersect(firstStart, firstEnd, secondStart, secondEnd) {
+  const firstTurn = getCrossProduct(firstStart, firstEnd, secondStart)
+  const secondTurn = getCrossProduct(firstStart, firstEnd, secondEnd)
+  const thirdTurn = getCrossProduct(secondStart, secondEnd, firstStart)
+  const fourthTurn = getCrossProduct(secondStart, secondEnd, firstEnd)
+  const epsilon = 0.001
+
+  const crosses = ((firstTurn > epsilon && secondTurn < -epsilon) || (firstTurn < -epsilon && secondTurn > epsilon))
+    && ((thirdTurn > epsilon && fourthTurn < -epsilon) || (thirdTurn < -epsilon && fourthTurn > epsilon))
+
+  return crosses
+    || (Math.abs(firstTurn) <= epsilon && isPointOnSegment(secondStart, firstStart, firstEnd))
+    || (Math.abs(secondTurn) <= epsilon && isPointOnSegment(secondEnd, firstStart, firstEnd))
+    || (Math.abs(thirdTurn) <= epsilon && isPointOnSegment(firstStart, secondStart, secondEnd))
+    || (Math.abs(fourthTurn) <= epsilon && isPointOnSegment(firstEnd, secondStart, secondEnd))
+}
+
+function hasSelfIntersection(points) {
+  for (let firstIndex = 0; firstIndex < points.length; firstIndex += 1) {
+    const firstEndIndex = (firstIndex + 1) % points.length
+
+    for (let secondIndex = firstIndex + 1; secondIndex < points.length; secondIndex += 1) {
+      const secondEndIndex = (secondIndex + 1) % points.length
+      const adjacent = firstEndIndex === secondIndex
+        || secondEndIndex === firstIndex
+        || (firstIndex === 0 && secondEndIndex === 0)
+
+      if (adjacent) continue
+
+      if (doSegmentsIntersect(
+        points[firstIndex],
+        points[firstEndIndex],
+        points[secondIndex],
+        points[secondEndIndex],
+      )) return true
+    }
+  }
+
+  return false
 }
 
 function getWallDistanceAhead(points, position, heading, laserLength, wallDistance, sensorOffset) {
@@ -238,29 +322,44 @@ function formatLapTime(milliseconds) {
 
 function generateTrack(seed = Math.floor(Math.random() * 0xffffff)) {
   const random = createRandom(seed)
-  const turnCount = 12 + Math.floor(random() * 5)
   const center = { x: WORLD_WIDTH / 2, y: WORLD_HEIGHT / 2 + 18 }
-  const controlPoints = []
-  const waveCount = 3 + Math.floor(random() * 2)
-  const wavePhase = random() * TAU
+  let points = null
+  let anchorPoints = null
 
-  for (let index = 0; index < turnCount; index += 1) {
-    const progress = index / turnCount
-    const angle = progress * TAU - Math.PI / 2
-      + Math.sin(progress * TAU * waveCount + wavePhase) * 0.08
-      + (random() - 0.5) * 0.24
-    const radialWave = Math.sin(progress * TAU * waveCount + wavePhase) * (0.16 + random() * 0.08)
-    const localBulge = (random() - 0.5) * 0.14
-    const radiusScale = Phaser.Math.Clamp(1 + radialWave + localBulge, 0.76, 1.26)
-    const radiusX = (1080 + random() * 180) * radiusScale
-    const radiusY = (620 + random() * 140) * radiusScale
-    controlPoints.push({
-      x: center.x + Math.cos(angle) * radiusX,
-      y: center.y + Math.sin(angle) * radiusY,
-    })
+  for (let attempt = 0; attempt < 8; attempt += 1) {
+    const candidateAnchors = []
+
+    for (let index = 0; index < 8; index += 1) {
+      const sectorStart = -Math.PI / 2 + index * TAU / 8
+      const angle = sectorStart + 0.12 + random() * 0.54
+      const radius = 0.74 + random() * 0.16
+      candidateAnchors.push({
+        x: center.x + Math.cos(angle) * radius * WORLD_WIDTH * 0.43,
+        y: center.y + Math.sin(angle) * radius * WORLD_HEIGHT * 0.43,
+      })
+    }
+
+    const candidatePoints = buildBezierLoop(candidateAnchors)
+
+    if (!hasSelfIntersection(candidatePoints)) {
+      points = candidatePoints
+      anchorPoints = candidateAnchors
+      break
+    }
   }
 
-  const points = smoothLoop(controlPoints)
+  if (!points) {
+    anchorPoints = Array.from({ length: 8 }, (_, index) => {
+      const angle = -Math.PI / 2 + (index + 0.5) * TAU / 8
+      const radius = 0.8
+      return {
+        x: center.x + Math.cos(angle) * radius * WORLD_WIDTH * 0.43,
+        y: center.y + Math.sin(angle) * radius * WORLD_HEIGHT * 0.43,
+      }
+    })
+    points = buildBezierLoop(anchorPoints)
+  }
+
   let length = 0
 
   for (let index = 0; index < points.length; index += 1) {
@@ -270,7 +369,8 @@ function generateTrack(seed = Math.floor(Math.random() * 0xffffff)) {
   return {
     seed,
     id: formatSeed(seed),
-    turnCount,
+    turnCount: anchorPoints.length,
+    anchors: anchorPoints,
     points,
     length: Math.round(length / 5.6),
   }
@@ -841,7 +941,7 @@ class RaceTrackScene extends Phaser.Scene {
 
   updateReadout() {
     document.querySelector('#track-id').textContent = this.track.id
-    document.querySelector('#turn-count').textContent = this.track.turnCount.toString().padStart(2, '0')
+    document.querySelector('#anchor-count').textContent = this.track.turnCount.toString().padStart(2, '0')
     document.querySelector('#track-length').textContent = this.track.length.toString().padStart(3, '0')
     document.querySelector('#velocity-readout').textContent = this.getVelocityKph().toString().padStart(3, '0')
     document.querySelector('#heading-readout').textContent = Math.round(Phaser.Math.RadToDeg(this.racerHeading + TAU) % 360).toString().padStart(3, '0')
