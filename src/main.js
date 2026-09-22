@@ -55,12 +55,14 @@ app.innerHTML = `
       <div class="readout-block sensor-controls">
         <div class="telemetry-head"><span>FORWARD SENSOR</span><span class="telemetry-live" id="sensor-status">CLEAR</span></div>
         <label class="slider-label" for="max-speed"><span>MAX SPEED</span><output id="max-speed-value">064</output><small>KM/H</small></label>
-        <input class="sensor-slider" id="max-speed" type="range" min="20" max="120" step="4" value="64" aria-label="Maximum speed">
+        <input class="sensor-slider" id="max-speed" type="range" min="20" max="200" step="4" value="64" aria-label="Maximum speed">
         <label class="slider-label" for="laser-range"><span>LASER LENGTH</span><output id="laser-length-value">240</output><small>PX</small></label>
         <input class="sensor-slider" id="laser-range" type="range" min="80" max="320" step="10" value="240" aria-label="Laser length">
         <label class="slider-label" for="brake-force"><span>BRAKE FORCE</span><output id="brake-force-value">100</output><small>%</small></label>
         <input class="sensor-slider" id="brake-force" type="range" min="0" max="200" step="10" value="100" aria-label="Brake force">
-        <div class="telemetry-head radar-readout"><span>RADAR STEERING</span><span class="telemetry-live" id="radar-status">CLEAR</span></div>
+        <label class="slider-label" for="steering-correction"><span>STEERING CORRECTION</span><output id="steering-correction-value">100</output><small>%</small></label>
+        <input class="sensor-slider" id="steering-correction" type="range" min="0" max="200" step="10" value="100" aria-label="Steering correction">
+        <div class="telemetry-head clearance-readout"><span>CORNER CLEARANCE</span><span class="telemetry-live" id="clearance-status">CLEAR</span></div>
       </div>
       <p class="readout-footnote">TRACK GENERATOR V1.0<br>READY FOR TRAFFIC AGENTS</p>
     </aside>
@@ -73,6 +75,7 @@ const GAME_WIDTH = 1280
 const GAME_HEIGHT = 760
 const WORLD_WIDTH = 3600
 const WORLD_HEIGHT = 2400
+const MAX_SPEED_LIMIT_KPH = 200
 
 function createRandom(seed = Math.floor(Math.random() * 0xffffff)) {
   let value = seed >>> 0
@@ -159,7 +162,12 @@ function getNormal(angle) {
 }
 
 function getDistanceToTrack(points, position) {
+  return getNearestTrackPoint(points, position).distance
+}
+
+function getNearestTrackPoint(points, position) {
   let nearestDistance = Infinity
+  let nearestPoint = null
 
   for (let index = 0; index < points.length; index += 1) {
     const start = points[index]
@@ -177,10 +185,13 @@ function getDistanceToTrack(points, position) {
     const closestY = start.y + segmentY * clampedProjection
     const distance = Phaser.Math.Distance.Between(position.x, position.y, closestX, closestY)
 
-    nearestDistance = Math.min(nearestDistance, distance)
+    if (distance < nearestDistance) {
+      nearestDistance = distance
+      nearestPoint = { x: closestX, y: closestY }
+    }
   }
 
-  return nearestDistance
+  return { distance: nearestDistance, point: nearestPoint }
 }
 
 function getCrossProduct(first, second, third) {
@@ -252,15 +263,24 @@ function getWallDistanceAhead(points, position, heading, laserLength, wallDistan
       x: position.x + directionX * sampleDistance,
       y: position.y + directionY * sampleDistance,
     }
-    const trackDistance = getDistanceToTrack(points, samplePosition)
+    const nearestTrackPoint = getNearestTrackPoint(points, samplePosition)
+    const trackDistance = nearestTrackPoint.distance
 
     if (trackDistance >= wallDistance) {
       const distanceChange = trackDistance - previousTrackDistance
       const wallRatio = distanceChange <= 0
         ? 0
         : Phaser.Math.Clamp((wallDistance - previousTrackDistance) / distanceChange, 0, 1)
+      const leftNormalX = Math.sin(heading)
+      const leftNormalY = -Math.cos(heading)
+      const lateralOffset = (nearestTrackPoint.point.x - samplePosition.x) * leftNormalX
+        + (nearestTrackPoint.point.y - samplePosition.y) * leftNormalY
+      const side = Math.abs(lateralOffset) < 8 ? 'FRONT' : lateralOffset > 0 ? 'RIGHT' : 'LEFT'
 
-      return { distance: previousBeamDistance + (beamDistance - previousBeamDistance) * wallRatio }
+      return {
+        distance: previousBeamDistance + (beamDistance - previousBeamDistance) * wallRatio,
+        side,
+      }
     }
 
     previousBeamDistance = beamDistance
@@ -270,62 +290,126 @@ function getWallDistanceAhead(points, position, heading, laserLength, wallDistan
   return null
 }
 
-function getWallDistanceAlongRay(points, position, angle, rayLength, wallDistance, sensorOffset) {
-  const directionX = Math.cos(angle)
-  const directionY = Math.sin(angle)
-  const sampleStep = 10
+function getSideNormal(angle, side) {
+  const leftNormal = { x: Math.sin(angle), y: -Math.cos(angle) }
+  return side === 'left' ? leftNormal : { x: -leftNormal.x, y: -leftNormal.y }
+}
 
-  for (let rayDistance = 0; rayDistance <= rayLength; rayDistance += sampleStep) {
-    const sampleDistance = sensorOffset + rayDistance
-    const samplePosition = {
-      x: position.x + directionX * sampleDistance,
-      y: position.y + directionY * sampleDistance,
+function getBoundaryPoints(points, side, wallOffset) {
+  return points.map((point, index) => {
+    const normal = getSideNormal(getTangent(points, index), side)
+    return {
+      x: point.x + normal.x * wallOffset,
+      y: point.y + normal.y * wallOffset,
     }
-
-    if (getDistanceToTrack(points, samplePosition) >= wallDistance) return { distance: rayDistance, angle }
-  }
-
-  return null
+  })
 }
 
-function getRadarDetection(points, position, heading, radarLength, radarHalfAngle, wallDistance, sensorOffset) {
-  const raysPerSide = 5
-  const minimumRayAngle = 0.12
-  let left = null
-  let right = null
-
-  for (let index = 0; index < raysPerSide; index += 1) {
-    const rayFraction = (index + 1) / (raysPerSide + 1)
-    const rayAngle = minimumRayAngle + (radarHalfAngle - minimumRayAngle) * rayFraction
-    const leftHit = getWallDistanceAlongRay(points, position, heading - rayAngle, radarLength, wallDistance, sensorOffset)
-    const rightHit = getWallDistanceAlongRay(points, position, heading + rayAngle, radarLength, wallDistance, sensorOffset)
-
-    if (leftHit && (!left || leftHit.distance < left.distance)) left = leftHit
-    if (rightHit && (!right || rightHit.distance < right.distance)) right = rightHit
+function getClosestPointOnSegment(point, start, end) {
+  const segmentX = end.x - start.x
+  const segmentY = end.y - start.y
+  const segmentLengthSquared = segmentX * segmentX + segmentY * segmentY
+  const offsetX = point.x - start.x
+  const offsetY = point.y - start.y
+  const projection = segmentLengthSquared === 0
+    ? 0
+    : (offsetX * segmentX + offsetY * segmentY) / segmentLengthSquared
+  const amount = Math.max(0, Math.min(1, projection))
+  const closest = {
+    x: start.x + segmentX * amount,
+    y: start.y + segmentY * amount,
   }
 
-  return { left, right }
+  return { point: closest, distance: distanceBetween(point, closest) }
 }
 
-function getClearanceSteeringBias(points, position, heading, lookaheadDistance, lateralOffset) {
+function getSegmentCircleIntersections(start, end, center, radius) {
+  const segmentX = end.x - start.x
+  const segmentY = end.y - start.y
+  const offsetX = start.x - center.x
+  const offsetY = start.y - center.y
+  const coefficientA = segmentX * segmentX + segmentY * segmentY
+  if (coefficientA === 0) return []
+
+  const coefficientB = 2 * (offsetX * segmentX + offsetY * segmentY)
+  const coefficientC = offsetX * offsetX + offsetY * offsetY - radius * radius
+  const discriminant = coefficientB * coefficientB - 4 * coefficientA * coefficientC
+  if (discriminant < 0) return []
+
+  const squareRoot = Math.sqrt(discriminant)
+  const amounts = [
+    (-coefficientB - squareRoot) / (2 * coefficientA),
+    (-coefficientB + squareRoot) / (2 * coefficientA),
+  ]
+
+  return amounts
+    .filter(amount => amount >= 0 && amount <= 1)
+    .map(amount => ({
+      x: start.x + segmentX * amount,
+      y: start.y + segmentY * amount,
+    }))
+}
+
+function getCornerWallContact(boundaryPoints, sensorCenter, heading, side, sensorRadius) {
   const directionX = Math.cos(heading)
   const directionY = Math.sin(heading)
-  const leftNormalX = Math.sin(heading)
-  const leftNormalY = -Math.cos(heading)
-  const rightNormalX = -leftNormalX
-  const rightNormalY = -leftNormalY
-  const forwardX = position.x + directionX * lookaheadDistance
-  const forwardY = position.y + directionY * lookaheadDistance
-  const leftClearance = getDistanceToTrack(points, {
-    x: forwardX + leftNormalX * lateralOffset,
-    y: forwardY + leftNormalY * lateralOffset,
-  })
-  const rightClearance = getDistanceToTrack(points, {
-    x: forwardX + rightNormalX * lateralOffset,
-    y: forwardY + rightNormalY * lateralOffset,
-  })
+  let nearest = null
+  let intersection = null
 
-  return Phaser.Math.Clamp((leftClearance - rightClearance) / lateralOffset, -1, 1)
+  for (let index = 0; index < boundaryPoints.length; index += 1) {
+    const start = boundaryPoints[index]
+    const end = boundaryPoints[(index + 1) % boundaryPoints.length]
+    const closest = getClosestPointOnSegment(sensorCenter, start, end)
+    if (!nearest || closest.distance < nearest.distance) nearest = closest
+
+    for (const candidate of getSegmentCircleIntersections(start, end, sensorCenter, sensorRadius)) {
+      const relativeX = candidate.x - sensorCenter.x
+      const relativeY = candidate.y - sensorCenter.y
+      const forwardDistance = relativeX * directionX + relativeY * directionY
+      if (!intersection || forwardDistance > intersection.forwardDistance) {
+        intersection = { point: candidate, forwardDistance }
+      }
+    }
+  }
+
+  const contactPoint = intersection ? intersection.point : nearest.point
+  const contactAngle = Phaser.Math.Angle.Wrap(
+    Phaser.Math.Angle.Between(sensorCenter.x, sensorCenter.y, contactPoint.x, contactPoint.y) - heading,
+  )
+
+  return {
+    center: sensorCenter,
+    point: contactPoint,
+    clearance: nearest.distance,
+    intersects: Boolean(intersection),
+    angle: contactAngle,
+    side,
+  }
+}
+
+function getCornerClearanceDetection(points, position, heading, wallOffset, sensorRadius, forwardOffset, lateralOffset) {
+  const directionX = Math.cos(heading)
+  const directionY = Math.sin(heading)
+  const leftNormal = getSideNormal(heading, 'left')
+  const sensorBase = {
+    x: position.x + directionX * forwardOffset,
+    y: position.y + directionY * forwardOffset,
+  }
+  const leftCenter = {
+    x: sensorBase.x + leftNormal.x * lateralOffset,
+    y: sensorBase.y + leftNormal.y * lateralOffset,
+  }
+  const rightCenter = {
+    x: sensorBase.x - leftNormal.x * lateralOffset,
+    y: sensorBase.y - leftNormal.y * lateralOffset,
+  }
+  const leftBoundary = getBoundaryPoints(points, 'left', wallOffset)
+  const rightBoundary = getBoundaryPoints(points, 'right', wallOffset)
+
+  return {
+    left: getCornerWallContact(leftBoundary, leftCenter, heading, 'left', sensorRadius),
+    right: getCornerWallContact(rightBoundary, rightCenter, heading, 'right', sensorRadius),
+  }
 }
 
 function formatSeed(seed) {
@@ -425,13 +509,14 @@ class RaceTrackScene extends Phaser.Scene {
     this.laserLength = 240
     this.brakingDistance = 240
     this.brakeForceScale = 1
-    this.radarLength = 280
-    this.radarHalfAngle = 0.72
-    this.radarSteeringRate = 0.0015
-    this.radarSteering = 0
-    this.radarEscapeDirection = 1
+    this.cornerSensorRadius = 100
+    this.cornerSensorForwardOffset = 20
+    this.cornerSensorLateralOffset = 16
+    this.steeringCorrectionScale = 1
+    this.steeringRate = 0.005
+    this.steeringCommand = 0
     this.laserGraphics = null
-    this.radarGraphics = null
+    this.cornerSensorGraphics = null
   }
 
   create() {
@@ -446,8 +531,8 @@ class RaceTrackScene extends Phaser.Scene {
     if (!this.track || !this.racer || this.carCrashed) return
 
     const wallDetection = this.getWallDetection()
-    const radarDetection = this.getRadarDetection()
-    this.updateSteering(radarDetection, wallDetection, delta)
+    const clearanceDetection = this.getCornerClearanceDetection()
+    this.updateSteering(clearanceDetection, delta)
     const safeSpeed = this.getSafeSpeed(wallDetection)
     const isBraking = this.driveSpeed > safeSpeed
     const responseRate = isBraking
@@ -472,9 +557,9 @@ class RaceTrackScene extends Phaser.Scene {
     document.querySelector('#velocity-readout').textContent = velocity.toString().padStart(3, '0')
     document.querySelector('#heading-readout').textContent = Math.round(Phaser.Math.RadToDeg(this.racerHeading + TAU) % 360).toString().padStart(3, '0')
     this.updateLaser(wallDetection)
-    const updatedRadarDetection = this.getRadarDetection()
-    this.updateRadar(updatedRadarDetection)
-    this.updateRadarReadout(updatedRadarDetection)
+    const updatedClearanceDetection = this.getCornerClearanceDetection()
+    this.updateCornerSensorLines(updatedClearanceDetection)
+    this.updateClearanceReadout(updatedClearanceDetection)
     this.updateSensorReadout(wallDetection)
     this.updateMinimap()
   }
@@ -535,7 +620,7 @@ class RaceTrackScene extends Phaser.Scene {
     this.trackLayer.add([outer, road, curbs])
     this.drawStartFinish(points)
     this.createRacer(points)
-    this.createRadarSensor()
+    this.createCornerSensorLines()
     this.createLaserPointer()
     this.updateMinimap()
   }
@@ -628,125 +713,100 @@ class RaceTrackScene extends Phaser.Scene {
     this.cameras.main.startFollow(this.racer, true, 0.08, 0.08)
   }
 
-  createRadarSensor() {
-    this.radarGraphics = this.add.graphics()
-    this.radarGraphics.setDepth(7)
-    this.trackLayer.add(this.radarGraphics)
-  }
-
   createLaserPointer() {
     this.laserGraphics = this.add.graphics()
     this.laserGraphics.setDepth(8)
     this.trackLayer.add(this.laserGraphics)
   }
 
-  getRadarDetection() {
-    return getRadarDetection(
+  createCornerSensorLines() {
+    this.cornerSensorGraphics = this.add.graphics()
+    this.cornerSensorGraphics.setDepth(7)
+    this.trackLayer.add(this.cornerSensorGraphics)
+  }
+
+  getCornerClearanceDetection() {
+    return getCornerClearanceDetection(
       this.track.points,
       this.racer,
       this.racerHeading,
-      this.radarLength,
-      this.radarHalfAngle,
       this.roadWidth / 2,
-      this.racerCollisionRadius,
+      this.cornerSensorRadius,
+      this.cornerSensorForwardOffset,
+      this.cornerSensorLateralOffset,
     )
   }
 
-  updateSteering(radarDetection, wallDetection, delta) {
-    const leftDanger = radarDetection.left
-      ? Phaser.Math.Clamp(1 - radarDetection.left.distance / this.radarLength, 0, 1)
-      : 0
-    const rightDanger = radarDetection.right
-      ? Phaser.Math.Clamp(1 - radarDetection.right.distance / this.radarLength, 0, 1)
-      : 0
-    let steeringBias = Phaser.Math.Clamp((leftDanger - rightDanger) * 1.8, -1, 1)
-    const sameWallAhead = wallDetection
-      && radarDetection.left
-      && radarDetection.right
-      && Math.abs(radarDetection.left.distance - radarDetection.right.distance) < 24
+  updateCornerSensorLines(clearanceDetection) {
+    if (!this.cornerSensorGraphics) return
 
-    if (sameWallAhead) {
-      const clearanceBias = getClearanceSteeringBias(
-        this.track.points,
-        this.racer,
-        this.racerHeading,
-        Math.min(wallDetection.distance + 90, this.radarLength),
-        this.roadWidth * 1.2,
-      )
-      this.radarEscapeDirection = Math.abs(clearanceBias) > 0.15
-        ? Math.sign(clearanceBias)
-        : this.radarEscapeDirection
-      steeringBias = this.radarEscapeDirection * Math.max(Math.abs(steeringBias), 0.7)
-    }
-    const steeringDirectionChanged = steeringBias !== 0
-      && this.radarSteering !== 0
-      && Math.sign(steeringBias) !== Math.sign(this.radarSteering)
-
-    this.radarSteering = steeringDirectionChanged
-      ? steeringBias
-      : Phaser.Math.Linear(this.radarSteering, steeringBias, Math.min(delta / 100, 1))
-    this.racerHeading += this.radarSteering * this.radarSteeringRate * delta
-  }
-
-  updateRadar(radarDetection) {
-    if (!this.radarGraphics || !this.racer) return
-
-    const startDistance = this.racerCollisionRadius
-    const endDistance = startDistance + this.radarLength
-    const leftAngle = this.racerHeading - this.radarHalfAngle
-    const rightAngle = this.racerHeading + this.radarHalfAngle
-    const startX = this.racer.x + Math.cos(this.racerHeading) * startDistance
-    const startY = this.racer.y + Math.sin(this.racerHeading) * startDistance
-    const leftX = this.racer.x + Math.cos(leftAngle) * endDistance
-    const leftY = this.racer.y + Math.sin(leftAngle) * endDistance
-    const rightX = this.racer.x + Math.cos(rightAngle) * endDistance
-    const rightY = this.racer.y + Math.sin(rightAngle) * endDistance
-    const hasDetection = Boolean(radarDetection.left || radarDetection.right)
-    const color = hasDetection ? 0xe9674e : 0xe8e2a6
-    const graphics = this.radarGraphics
-
+    const graphics = this.cornerSensorGraphics
     graphics.clear()
-    graphics.fillStyle(color, 0.08)
-    graphics.beginPath()
-    graphics.moveTo(startX, startY)
-    graphics.lineTo(leftX, leftY)
-    graphics.lineTo(rightX, rightY)
-    graphics.closePath()
-    graphics.fillPath()
-    graphics.lineStyle(1, color, 0.55)
-    graphics.lineBetween(startX, startY, leftX, leftY)
-    graphics.lineBetween(startX, startY, rightX, rightY)
+    const sensors = [
+      { sensor: clearanceDetection.left, color: 0xe9674e },
+      { sensor: clearanceDetection.right, color: 0x42d879 },
+    ]
 
-    if (radarDetection.left) {
-      const hitDistance = startDistance + radarDetection.left.distance
-      graphics.fillStyle(0xe9674e, 0.9)
-      graphics.fillCircle(
-        this.racer.x + Math.cos(radarDetection.left.angle) * hitDistance,
-        this.racer.y + Math.sin(radarDetection.left.angle) * hitDistance,
-        3,
-      )
-    }
-
-    if (radarDetection.right) {
-      const hitDistance = startDistance + radarDetection.right.distance
-      graphics.fillStyle(0xe9674e, 0.9)
-      graphics.fillCircle(
-        this.racer.x + Math.cos(radarDetection.right.angle) * hitDistance,
-        this.racer.y + Math.sin(radarDetection.right.angle) * hitDistance,
-        3,
-      )
+    for (const { sensor, color } of sensors) {
+      graphics.lineStyle(2, color, 0.95)
+      graphics.lineBetween(sensor.center.x, sensor.center.y, sensor.point.x, sensor.point.y)
+      this.drawSensorAngle(graphics, sensor, color)
     }
   }
 
-  updateRadarReadout(radarDetection) {
-    const status = document.querySelector('#radar-status')
+  drawSensorAngle(graphics, sensor, color) {
+    const arcRadius = 28
+    const steps = Math.max(4, Math.ceil(Math.abs(sensor.angle) * 12))
+
+    graphics.lineStyle(2, color, 0.95)
+    graphics.beginPath()
+    for (let step = 0; step <= steps; step += 1) {
+      const angle = this.racerHeading + sensor.angle * step / steps
+      const x = sensor.center.x + Math.cos(angle) * arcRadius
+      const y = sensor.center.y + Math.sin(angle) * arcRadius
+      if (step === 0) graphics.moveTo(x, y)
+      else graphics.lineTo(x, y)
+    }
+    graphics.strokePath()
+  }
+
+  updateSteering(clearanceDetection, delta) {
+    const leftClearance = clearanceDetection.left.clearance
+    const rightClearance = clearanceDetection.right.clearance
+    const clearanceBias = Phaser.Math.Clamp(
+      (rightClearance - leftClearance) / this.cornerSensorRadius,
+      -1,
+      1,
+    )
+    const leftAngleBias = clearanceDetection.left.intersects
+      ? Phaser.Math.Clamp(clearanceDetection.left.angle / (Math.PI / 2), -1, 1)
+      : 0
+    const rightAngleBias = clearanceDetection.right.intersects
+      ? Phaser.Math.Clamp(clearanceDetection.right.angle / (Math.PI / 2), -1, 1)
+      : 0
+    const angleBias = (leftAngleBias + rightAngleBias) * 0.5
+    let steeringBias = Phaser.Math.Clamp(clearanceBias * 0.65 + angleBias * 0.35, -1, 1)
+    steeringBias = Phaser.Math.Clamp(steeringBias * this.steeringCorrectionScale, -1, 1)
+
+    const steeringDirectionChanged = steeringBias !== 0
+      && this.steeringCommand !== 0
+      && Math.sign(steeringBias) !== Math.sign(this.steeringCommand)
+
+    this.steeringCommand = steeringDirectionChanged
+      ? steeringBias
+      : Phaser.Math.Linear(this.steeringCommand, steeringBias, Math.min(delta / 100, 1))
+    this.racerHeading += this.steeringCommand * this.steeringRate * delta
+  }
+
+  updateClearanceReadout(clearanceDetection) {
+    const status = document.querySelector('#clearance-status')
     if (!status) return
 
-    const leftDistance = radarDetection.left ? Math.round(radarDetection.left.distance).toString().padStart(3, '0') : '---'
-    const rightDistance = radarDetection.right ? Math.round(radarDetection.right.distance).toString().padStart(3, '0') : '---'
-    const hasDetection = Boolean(radarDetection.left || radarDetection.right)
+    const leftDistance = Math.round(clearanceDetection.left.clearance).toString().padStart(3, '0')
+    const rightDistance = Math.round(clearanceDetection.right.clearance).toString().padStart(3, '0')
+    const hasDetection = clearanceDetection.left.intersects || clearanceDetection.right.intersects
 
-    status.textContent = hasDetection ? `L ${leftDistance} / R ${rightDistance}` : 'CLEAR'
+    status.textContent = `${hasDetection ? 'WALL' : 'CLEAR'} L ${leftDistance} / R ${rightDistance}`
     status.classList.toggle('sensor-warning', hasDetection)
   }
 
@@ -915,7 +975,7 @@ class RaceTrackScene extends Phaser.Scene {
     if (!status) return
 
     if (wallDetection) {
-      status.textContent = `WALL ${Math.round(wallDetection.distance).toString().padStart(3, '0')}`
+      status.textContent = `WALL ${wallDetection.side} ${Math.round(wallDetection.distance).toString().padStart(3, '0')}`
       status.classList.add('sensor-warning')
     } else {
       status.textContent = 'CLEAR'
@@ -933,7 +993,7 @@ class RaceTrackScene extends Phaser.Scene {
   }
 
   setMaxSpeed(speed) {
-    this.maxSpeedKph = Phaser.Math.Clamp(Number(speed), 20, 120)
+    this.maxSpeedKph = Phaser.Math.Clamp(Number(speed), 20, MAX_SPEED_LIMIT_KPH)
     this.cruiseSpeed = this.maxSpeedKph * this.speedPerKph
     this.driveSpeed = Math.min(this.driveSpeed, this.cruiseSpeed)
     document.querySelector('#max-speed-value').textContent = this.maxSpeedKph.toString().padStart(3, '0')
@@ -944,6 +1004,11 @@ class RaceTrackScene extends Phaser.Scene {
     document.querySelector('#brake-force-value').textContent = Math.round(this.brakeForceScale * 100).toString()
   }
 
+  setSteeringCorrectionScale(scale) {
+    this.steeringCorrectionScale = Phaser.Math.Clamp(Number(scale) / 100, 0, 2)
+    document.querySelector('#steering-correction-value').textContent = Math.round(this.steeringCorrectionScale * 100).toString()
+  }
+
   crashCar() {
     this.carCrashed = true
     this.driveSpeed = 0
@@ -951,7 +1016,7 @@ class RaceTrackScene extends Phaser.Scene {
     document.querySelector('#telemetry-state').textContent = 'CRASHED'
     document.querySelector('#telemetry-speed').style.width = '0%'
     this.updateLaser({ distance: 0 })
-    this.updateSensorReadout({ distance: 0 })
+    this.updateSensorReadout({ distance: 0, side: 'FRONT' })
 
     const sparks = this.add.graphics()
     sparks.lineStyle(3, 0xe9674e, 0.95)
@@ -978,6 +1043,9 @@ class RaceTrackScene extends Phaser.Scene {
     })
     crashLabel.setDepth(12)
     this.trackLayer.add([sparks, crashLabel])
+    const clearanceDetection = this.getCornerClearanceDetection()
+    this.updateCornerSensorLines(clearanceDetection)
+    this.updateClearanceReadout(clearanceDetection)
     this.updateMinimap()
     this.updateLapReadout()
   }
@@ -989,16 +1057,21 @@ class RaceTrackScene extends Phaser.Scene {
     document.querySelector('#velocity-readout').textContent = this.getVelocityKph().toString().padStart(3, '0')
     document.querySelector('#heading-readout').textContent = Math.round(Phaser.Math.RadToDeg(this.racerHeading + TAU) % 360).toString().padStart(3, '0')
     document.querySelector('#telemetry-state').textContent = 'LIVE'
-    document.querySelector('#telemetry-speed').style.width = `${Math.min(this.getVelocityKph() / 120 * 100, 100)}%`
+    document.querySelector('#telemetry-speed').style.width = `${Math.min(this.getVelocityKph() / MAX_SPEED_LIMIT_KPH * 100, 100)}%`
     document.querySelector('#max-speed').value = this.maxSpeedKph.toString()
     document.querySelector('#max-speed-value').textContent = this.maxSpeedKph.toString().padStart(3, '0')
     document.querySelector('#laser-range').value = this.laserLength.toString()
     document.querySelector('#laser-length-value').textContent = this.laserLength.toString()
     document.querySelector('#brake-force').value = Math.round(this.brakeForceScale * 100).toString()
     document.querySelector('#brake-force-value').textContent = Math.round(this.brakeForceScale * 100).toString()
+    document.querySelector('#steering-correction').value = Math.round(this.steeringCorrectionScale * 100).toString()
+    document.querySelector('#steering-correction-value').textContent = Math.round(this.steeringCorrectionScale * 100).toString()
     this.updateLapReadout()
     const wallDetection = this.getWallDetection()
+    const clearanceDetection = this.getCornerClearanceDetection()
     this.updateLaser(wallDetection)
+    this.updateCornerSensorLines(clearanceDetection)
+    this.updateClearanceReadout(clearanceDetection)
     this.updateSensorReadout(wallDetection)
   }
 }
@@ -1037,4 +1110,8 @@ document.querySelector('#laser-range').addEventListener('input', (event) => {
 
 document.querySelector('#brake-force').addEventListener('input', (event) => {
   game.scene.getScene('RaceTrackScene').setBrakeForceScale(event.target.value)
+})
+
+document.querySelector('#steering-correction').addEventListener('input', (event) => {
+  game.scene.getScene('RaceTrackScene').setSteeringCorrectionScale(event.target.value)
 })
