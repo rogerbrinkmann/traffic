@@ -57,12 +57,13 @@ app.innerHTML = `
         <label class="slider-label" for="max-speed"><span>MAX SPEED</span><output id="max-speed-value">064</output><small>KM/H</small></label>
         <input class="sensor-slider" id="max-speed" type="range" min="20" max="200" step="4" value="64" aria-label="Maximum speed">
         <label class="slider-label" for="laser-range"><span>LASER LENGTH</span><output id="laser-length-value">240</output><small>PX</small></label>
-        <input class="sensor-slider" id="laser-range" type="range" min="80" max="320" step="10" value="240" aria-label="Laser length">
+        <input class="sensor-slider" id="laser-range" type="range" min="80" max="600" step="10" value="240" aria-label="Laser length">
         <label class="slider-label" for="brake-force"><span>BRAKE FORCE</span><output id="brake-force-value">100</output><small>%</small></label>
         <input class="sensor-slider" id="brake-force" type="range" min="0" max="200" step="10" value="100" aria-label="Brake force">
         <label class="slider-label" for="steering-correction"><span>STEERING CORRECTION</span><output id="steering-correction-value">100</output><small>%</small></label>
         <input class="sensor-slider" id="steering-correction" type="range" min="0" max="200" step="10" value="100" aria-label="Steering correction">
         <div class="telemetry-head clearance-readout"><span>CORNER CLEARANCE</span><span class="telemetry-live" id="clearance-status">CLEAR</span></div>
+        <button class="reset-controls" id="reset-controls" type="button"><span class="button-glyph" aria-hidden="true">&#8635;</span><span>RESET CONTROLS</span></button>
       </div>
       <p class="readout-footnote">TRACK GENERATOR V1.0<br>READY FOR TRAFFIC AGENTS</p>
     </aside>
@@ -512,6 +513,7 @@ class RaceTrackScene extends Phaser.Scene {
     this.cornerSensorRadius = 100
     this.cornerSensorForwardOffset = 20
     this.cornerSensorLateralOffset = 16
+    this.cornerEmergencyDistance = 18
     this.steeringCorrectionScale = 1
     this.steeringRate = 0.005
     this.steeringCommand = 0
@@ -611,13 +613,11 @@ class RaceTrackScene extends Phaser.Scene {
     const { points } = this.track
     const outer = this.add.graphics()
     const road = this.add.graphics()
-    const curbs = this.add.graphics()
 
     this.drawLoop(outer, points, 112, 0x0a1111, 1)
     this.drawLoop(road, points, this.roadWidth + 8, 0x8a948e, 1)
     this.drawLoop(road, points, this.roadWidth, 0x303b39, 1)
-    this.drawCurbs(curbs, points)
-    this.trackLayer.add([outer, road, curbs])
+    this.trackLayer.add([outer, road])
     this.drawStartFinish(points)
     this.createRacer(points)
     this.createCornerSensorLines()
@@ -632,30 +632,6 @@ class RaceTrackScene extends Phaser.Scene {
     for (let index = 1; index < points.length; index += 1) graphics.lineTo(points[index].x, points[index].y)
     graphics.lineTo(points[0].x, points[0].y)
     graphics.strokePath()
-  }
-
-  drawCurbs(graphics, points) {
-    const curbWidth = this.roadWidth / 2 + 3
-    for (let index = 0; index < points.length; index += 4) {
-      const nextIndex = (index + 4) % points.length
-      const angle = getTangent(points, index)
-      const normal = getNormal(angle)
-      const isLight = Math.floor(index / 4) % 2 === 0
-      const color = isLight ? 0xe4dfc8 : 0xe0664f
-      graphics.lineStyle(7, color, 0.95)
-      graphics.lineBetween(
-        points[index].x + normal.x * curbWidth,
-        points[index].y + normal.y * curbWidth,
-        points[nextIndex].x + normal.x * curbWidth,
-        points[nextIndex].y + normal.y * curbWidth,
-      )
-      graphics.lineBetween(
-        points[index].x - normal.x * curbWidth,
-        points[index].y - normal.y * curbWidth,
-        points[nextIndex].x - normal.x * curbWidth,
-        points[nextIndex].y - normal.y * curbWidth,
-      )
-    }
   }
 
   drawStartFinish(points) {
@@ -785,7 +761,23 @@ class RaceTrackScene extends Phaser.Scene {
       ? Phaser.Math.Clamp(clearanceDetection.right.angle / (Math.PI / 2), -1, 1)
       : 0
     const angleBias = (leftAngleBias + rightAngleBias) * 0.5
-    let steeringBias = Phaser.Math.Clamp(clearanceBias * 0.65 + angleBias * 0.35, -1, 1)
+    const lowestClearance = Math.min(leftClearance, rightClearance)
+    const emergencyUrgency = Phaser.Math.Clamp(
+      (this.cornerEmergencyDistance - lowestClearance) / this.cornerEmergencyDistance,
+      0,
+      1,
+    )
+    const clearanceEscapeDirection = rightClearance > leftClearance
+      ? 1
+      : leftClearance > rightClearance
+        ? -1
+        : this.steeringCommand !== 0 ? Math.sign(this.steeringCommand) : 1
+    const emergencySteering = clearanceEscapeDirection * emergencyUrgency * 0.45
+    let steeringBias = Phaser.Math.Clamp(
+      clearanceBias * 0.65 + angleBias * 0.35 + emergencySteering,
+      -1,
+      1,
+    )
     steeringBias = Phaser.Math.Clamp(steeringBias * this.steeringCorrectionScale, -1, 1)
 
     const steeringDirectionChanged = steeringBias !== 0
@@ -824,8 +816,19 @@ class RaceTrackScene extends Phaser.Scene {
   getSafeSpeed(wallDetection) {
     if (!wallDetection) return this.cruiseSpeed
 
-    const distanceRatio = Phaser.Math.Clamp(wallDetection.distance / this.brakingDistance, 0, 1)
-    return this.cruiseSpeed * Math.sqrt(distanceRatio)
+    if (wallDetection.distance <= this.brakingDistance) {
+      const distanceRatio = Phaser.Math.Clamp(wallDetection.distance / this.brakingDistance, 0, 1)
+      return this.cruiseSpeed * Math.sqrt(distanceRatio)
+    }
+
+    const anticipationRange = Math.max(this.laserLength - this.brakingDistance, 1)
+    const anticipationRatio = Phaser.Math.Clamp(
+      (wallDetection.distance - this.brakingDistance) / anticipationRange,
+      0,
+      1,
+    )
+    const anticipationReduction = 0.08 * anticipationRatio * anticipationRatio
+    return this.cruiseSpeed * (1 - anticipationReduction)
   }
 
   getVelocityKph() {
@@ -944,13 +947,6 @@ class RaceTrackScene extends Phaser.Scene {
     const graphics = this.laserGraphics
 
     graphics.clear()
-    graphics.lineStyle(8, color, 0.1)
-    graphics.lineBetween(
-      this.racer.x + directionX * startDistance,
-      this.racer.y + directionY * startDistance,
-      this.racer.x + directionX * endDistance,
-      this.racer.y + directionY * endDistance,
-    )
     graphics.lineStyle(2, color, 0.85)
     graphics.lineBetween(
       this.racer.x + directionX * startDistance,
@@ -984,7 +980,7 @@ class RaceTrackScene extends Phaser.Scene {
   }
 
   setLaserLength(length) {
-    this.laserLength = Phaser.Math.Clamp(Number(length), 80, 320)
+    this.laserLength = Phaser.Math.Clamp(Number(length), 80, 600)
     document.querySelector('#laser-length-value').textContent = this.laserLength.toString()
 
     const wallDetection = this.getWallDetection()
@@ -1007,6 +1003,14 @@ class RaceTrackScene extends Phaser.Scene {
   setSteeringCorrectionScale(scale) {
     this.steeringCorrectionScale = Phaser.Math.Clamp(Number(scale) / 100, 0, 2)
     document.querySelector('#steering-correction-value').textContent = Math.round(this.steeringCorrectionScale * 100).toString()
+  }
+
+  resetControls() {
+    this.setMaxSpeed(64)
+    this.setLaserLength(240)
+    this.setBrakeForceScale(100)
+    this.setSteeringCorrectionScale(100)
+    this.updateReadout()
   }
 
   crashCar() {
@@ -1114,4 +1118,8 @@ document.querySelector('#brake-force').addEventListener('input', (event) => {
 
 document.querySelector('#steering-correction').addEventListener('input', (event) => {
   game.scene.getScene('RaceTrackScene').setSteeringCorrectionScale(event.target.value)
+})
+
+document.querySelector('#reset-controls').addEventListener('click', () => {
+  game.scene.getScene('RaceTrackScene').resetControls()
 })

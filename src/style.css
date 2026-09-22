@@ -130,6 +130,9 @@
   .sensor-slider::-moz-range-thumb { width: 10px; height: 10px; border: 1px solid var(--acid); border-radius: 50%; background: var(--ink); }
   .sensor-slider:focus-visible { outline: 1px solid var(--coral); outline-offset: 4px; }
   .sensor-slider + .slider-label { margin-top: 18px; }
+  .reset-controls { display: inline-flex; align-items: center; justify-content: center; gap: 8px; width: 100%; margin-top: 18px; padding: 9px 10px 8px; border: 1px solid rgba(194, 211, 194, 0.35); border-radius: 0; color: var(--paper); background: transparent; font-size: 9px; letter-spacing: 0.1em; }
+  .reset-controls:hover { border-color: var(--acid); background: rgba(232, 226, 166, 0.08); }
+  .reset-controls:focus-visible { outline: 2px solid var(--coral); outline-offset: 3px; }
   .readout-footnote { padding: 18px; color: #526b60; font-size: 8px; line-height: 1.8; letter-spacing: 0.08em; }
 
 
