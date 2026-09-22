@@ -39,7 +39,7 @@ app.innerHTML = `
           <div class="metric"><span class="metric-label">ANCHORS</span><strong id="anchor-count">--</strong></div>
           <div class="metric"><span class="metric-label">LENGTH</span><strong id="track-length">--</strong><small>M</small></div>
           <div class="metric"><span class="metric-label">WIDTH</span><strong>08</strong><small>M</small></div>
-          <div class="metric"><span class="metric-label">SURFACE</span><strong>DRY</strong></div>
+          <div class="metric"><span class="metric-label">CARS</span><strong id="car-count">03</strong></div>
         </div>
         <div class="readout-block telemetry">
           <div class="telemetry-head"><span>SCOUT TELEMETRY</span><span class="telemetry-live" id="telemetry-state">LIVE</span></div>
@@ -56,6 +56,10 @@ app.innerHTML = `
         <div class="telemetry-head"><span>FORWARD SENSOR</span><span class="telemetry-live" id="sensor-status">CLEAR</span></div>
         <label class="slider-label" for="max-speed"><span>MAX SPEED</span><output id="max-speed-value">064</output><small>KM/H</small></label>
         <input class="sensor-slider" id="max-speed" type="range" min="20" max="200" step="4" value="64" aria-label="Maximum speed">
+        <label class="slider-label" for="car-count-slider"><span>TOTAL CARS</span><output id="car-count-slider-value">03</output></label>
+        <input class="sensor-slider" id="car-count-slider" type="range" min="1" max="20" step="1" value="3" aria-label="Total cars">
+        <label class="slider-label" for="following-gap"><span>FOLLOWING GAP</span><output id="following-gap-value">046</output><small>PX</small></label>
+        <input class="sensor-slider" id="following-gap" type="range" min="20" max="160" step="2" value="46" aria-label="Following gap">
         <label class="slider-label" for="laser-range"><span>LASER LENGTH</span><output id="laser-length-value">240</output><small>PX</small></label>
         <input class="sensor-slider" id="laser-range" type="range" min="80" max="600" step="10" value="240" aria-label="Laser length">
         <label class="slider-label" for="brake-force"><span>BRAKE FORCE</span><output id="brake-force-value">100</output><small>%</small></label>
@@ -63,9 +67,9 @@ app.innerHTML = `
         <label class="slider-label" for="steering-correction"><span>STEERING CORRECTION</span><output id="steering-correction-value">100</output><small>%</small></label>
         <input class="sensor-slider" id="steering-correction" type="range" min="0" max="200" step="10" value="100" aria-label="Steering correction">
         <div class="telemetry-head clearance-readout"><span>CORNER CLEARANCE</span><span class="telemetry-live" id="clearance-status">CLEAR</span></div>
+        <div class="telemetry-head vehicle-gap-readout"><span>TRAFFIC GAP</span><span class="telemetry-live" id="vehicle-gap-status">CLEAR</span></div>
         <button class="reset-controls" id="reset-controls" type="button"><span class="button-glyph" aria-hidden="true">&#8635;</span><span>RESET CONTROLS</span></button>
       </div>
-      <p class="readout-footnote">TRACK GENERATOR V1.0<br>READY FOR TRAFFIC AGENTS</p>
     </aside>
   </section>
   </main>
@@ -193,6 +197,35 @@ function getNearestTrackPoint(points, position) {
   }
 
   return { distance: nearestDistance, point: nearestPoint }
+}
+
+function getTrackProgress(points, position) {
+  let nearestDistance = Infinity
+  let progress = 0
+
+  for (let index = 0; index < points.length; index += 1) {
+    const start = points[index]
+    const end = points[(index + 1) % points.length]
+    const segmentX = end.x - start.x
+    const segmentY = end.y - start.y
+    const segmentLengthSquared = segmentX * segmentX + segmentY * segmentY
+    const offsetX = position.x - start.x
+    const offsetY = position.y - start.y
+    const projection = segmentLengthSquared === 0
+      ? 0
+      : (offsetX * segmentX + offsetY * segmentY) / segmentLengthSquared
+    const amount = Math.max(0, Math.min(1, projection))
+    const closestX = start.x + segmentX * amount
+    const closestY = start.y + segmentY * amount
+    const distance = Phaser.Math.Distance.Between(position.x, position.y, closestX, closestY)
+
+    if (distance < nearestDistance) {
+      nearestDistance = distance
+      progress = (index + amount) / points.length
+    }
+  }
+
+  return progress
 }
 
 function getCrossProduct(first, second, third) {
@@ -481,6 +514,7 @@ function generateTrack(seed = Math.floor(Math.random() * 0xffffff)) {
     turnCount: anchorPoints.length,
     anchors: anchorPoints,
     points,
+    pathLength: length,
     length: Math.round(length / 5.6),
   }
 }
@@ -490,6 +524,8 @@ class RaceTrackScene extends Phaser.Scene {
     super('RaceTrackScene')
     this.track = null
     this.racer = null
+    this.trafficCars = []
+    this.trafficCarCount = 2
     this.racerHeading = 0
     this.startLinePoint = null
     this.startLineHeading = 0
@@ -514,11 +550,15 @@ class RaceTrackScene extends Phaser.Scene {
     this.cornerSensorForwardOffset = 20
     this.cornerSensorLateralOffset = 16
     this.cornerEmergencyDistance = 18
+    this.vehicleDetectionLength = 900
+    this.vehicleMinimumGap = 46
+    this.vehicleClosingTime = 0.35
     this.steeringCorrectionScale = 1
     this.steeringRate = 0.005
     this.steeringCommand = 0
     this.laserGraphics = null
     this.cornerSensorGraphics = null
+    this.vehicleSensorGraphics = null
   }
 
   create() {
@@ -534,8 +574,12 @@ class RaceTrackScene extends Phaser.Scene {
 
     const wallDetection = this.getWallDetection()
     const clearanceDetection = this.getCornerClearanceDetection()
+    const vehicleAhead = this.getVehicleAhead(this.getPlayerCarState())
+    const followingGap = vehicleAhead
+      ? this.getDesiredFollowingGap(this.driveSpeed, vehicleAhead.speed)
+      : this.vehicleMinimumGap
     this.updateSteering(clearanceDetection, delta)
-    const safeSpeed = this.getSafeSpeed(wallDetection)
+    const safeSpeed = this.getSafeSpeed(wallDetection, vehicleAhead, this.cruiseSpeed, this.driveSpeed)
     const isBraking = this.driveSpeed > safeSpeed
     const responseRate = isBraking
       ? this.brakingResponseRate * this.brakeForceScale
@@ -543,8 +587,11 @@ class RaceTrackScene extends Phaser.Scene {
     const response = 1 - Math.exp(-responseRate * delta)
     this.driveSpeed = Phaser.Math.Linear(this.driveSpeed, safeSpeed, response)
     const distance = this.driveSpeed * delta
-    const nextX = this.racer.x + Math.cos(this.racerHeading) * distance
-    const nextY = this.racer.y + Math.sin(this.racerHeading) * distance
+    const travelDistance = vehicleAhead
+      ? Math.min(distance, Math.max(0, vehicleAhead.distance - followingGap))
+      : distance
+    const nextX = this.racer.x + Math.cos(this.racerHeading) * travelDistance
+    const nextY = this.racer.y + Math.sin(this.racerHeading) * travelDistance
     this.racer.setPosition(nextX, nextY)
     this.racer.setRotation(this.racerHeading)
     this.updateLapTimer(delta)
@@ -563,6 +610,8 @@ class RaceTrackScene extends Phaser.Scene {
     this.updateCornerSensorLines(updatedClearanceDetection)
     this.updateClearanceReadout(updatedClearanceDetection)
     this.updateSensorReadout(wallDetection)
+    this.updateTrafficCars(delta)
+    this.updateVehicleSensor(this.getVehicleAhead(this.getPlayerCarState()))
     this.updateMinimap()
   }
 
@@ -608,6 +657,11 @@ class RaceTrackScene extends Phaser.Scene {
   renderTrack() {
     if (this.trackLayer) this.trackLayer.destroy()
     if (this.racer) this.racer.destroy()
+    for (const trafficCar of this.trafficCars) {
+      trafficCar.sprite.destroy()
+      trafficCar.sensorGraphics.destroy()
+    }
+    this.trafficCars = []
 
     this.trackLayer = this.add.container(0, 0)
     const { points } = this.track
@@ -620,8 +674,10 @@ class RaceTrackScene extends Phaser.Scene {
     this.trackLayer.add([outer, road])
     this.drawStartFinish(points)
     this.createRacer(points)
+    this.createTrafficCars(points)
     this.createCornerSensorLines()
     this.createLaserPointer()
+    this.createVehicleSensor()
     this.updateMinimap()
   }
 
@@ -689,10 +745,116 @@ class RaceTrackScene extends Phaser.Scene {
     this.cameras.main.startFollow(this.racer, true, 0.08, 0.08)
   }
 
+  createTrafficCars(points) {
+    const trafficPalette = [
+      { color: 0x4aa3df, accent: 0xd6f0ff, speedFactor: 0.82 },
+      { color: 0xb66be8, accent: 0xf0d9ff, speedFactor: 0.9 },
+      { color: 0x49c6a8, accent: 0xd8fff4, speedFactor: 0.76 },
+      { color: 0xe5a14b, accent: 0xfff0c9, speedFactor: 0.86 },
+      { color: 0xe46779, accent: 0xffd8df, speedFactor: 0.94 },
+      { color: 0x8d9bea, accent: 0xe0e4ff, speedFactor: 0.8 },
+      { color: 0xd1c45a, accent: 0xfff9c7, speedFactor: 0.88 },
+    ]
+
+    this.trafficCars = Array.from({ length: this.trafficCarCount }, (_, index) => {
+      const config = trafficPalette[index % trafficPalette.length]
+      const progress = (index + 1) / (this.trafficCarCount + 1)
+      const pointIndex = Math.floor(points.length * progress)
+      const point = points[pointIndex]
+      const heading = getTangent(points, pointIndex)
+      const sprite = this.createTrafficCarSprite(point, heading, config.color, config.accent)
+
+      return {
+        id: `traffic-${index + 1}`,
+        sprite,
+        heading,
+        speedFactor: config.speedFactor,
+        cruiseSpeed: this.cruiseSpeed * config.speedFactor,
+        speed: this.cruiseSpeed * config.speedFactor,
+        steeringCommand: 0,
+        sensorGraphics: this.createTrafficSensorGraphics(),
+        crashed: false,
+      }
+    })
+  }
+
+  rebuildTrafficCars() {
+    for (const trafficCar of this.trafficCars) {
+      trafficCar.sprite.destroy()
+      trafficCar.sensorGraphics.destroy()
+    }
+    this.trafficCars = []
+    this.createTrafficCars(this.track.points)
+    this.updateVehicleSensor(this.getVehicleAhead(this.getPlayerCarState()))
+    this.updateMinimap()
+  }
+
+  createTrafficCarSprite(position, heading, color, accent) {
+    const car = this.add.container(position.x, position.y)
+    const glow = this.add.ellipse(0, 0, 42, 24, color, 0.12)
+    const body = this.add.graphics()
+    body.fillStyle(color, 1)
+    body.fillRoundedRect(-16, -8, 32, 16, 5)
+    body.fillStyle(accent, 1)
+    body.fillRoundedRect(-4, -5, 11, 10, 3)
+    body.fillStyle(0x152020, 1)
+    body.fillRect(9, -6, 5, 12)
+    body.fillRect(-14, -10, 6, 4)
+    body.fillRect(-14, 6, 6, 4)
+    const beacon = this.add.circle(12, 0, 2, accent, 1)
+
+    car.add([glow, body, beacon])
+    car.setRotation(heading)
+    car.setDepth(9)
+    return car
+  }
+
+  createTrafficSensorGraphics() {
+    const graphics = this.add.graphics()
+    graphics.setDepth(6)
+    return graphics
+  }
+
   createLaserPointer() {
     this.laserGraphics = this.add.graphics()
     this.laserGraphics.setDepth(8)
     this.trackLayer.add(this.laserGraphics)
+  }
+
+  createVehicleSensor() {
+    this.vehicleSensorGraphics = this.add.graphics()
+    this.vehicleSensorGraphics.setDepth(6)
+    this.trackLayer.add(this.vehicleSensorGraphics)
+  }
+
+  updateVehicleSensor(vehicleAhead) {
+    const status = document.querySelector('#vehicle-gap-status')
+    if (!this.vehicleSensorGraphics || !status || !this.racer) return
+
+    const graphics = this.vehicleSensorGraphics
+    graphics.clear()
+
+    if (!vehicleAhead) {
+      status.textContent = 'CLEAR'
+      status.classList.remove('sensor-warning')
+      return
+    }
+
+    const directionX = Math.cos(this.racerHeading)
+    const directionY = Math.sin(this.racerHeading)
+    const startDistance = this.racerCollisionRadius
+    const startX = this.racer.x + directionX * startDistance
+    const startY = this.racer.y + directionY * startDistance
+    const targetX = vehicleAhead.car.sprite.x
+    const targetY = vehicleAhead.car.sprite.y
+
+    graphics.lineStyle(2, 0x65b8e8, 0.9)
+    graphics.lineBetween(startX, startY, targetX, targetY)
+    graphics.fillStyle(0x65b8e8, 0.95)
+    graphics.fillCircle(targetX, targetY, 5)
+
+    status.textContent = `CAR ${Math.round(vehicleAhead.distance).toString().padStart(3, '0')}`
+    status.classList.add('sensor-warning')
   }
 
   createCornerSensorLines() {
@@ -713,6 +875,155 @@ class RaceTrackScene extends Phaser.Scene {
     )
   }
 
+  getPlayerCarState() {
+    return {
+      id: 'scout',
+      sprite: this.racer,
+      heading: this.racerHeading,
+      speed: this.driveSpeed,
+      crashed: this.carCrashed,
+    }
+  }
+
+  getAllCars() {
+    return [this.getPlayerCarState(), ...this.trafficCars]
+  }
+
+  getVehicleAhead(car) {
+    const carProgress = getTrackProgress(this.track.points, car.sprite)
+    let nearest = null
+
+    for (const otherCar of this.getAllCars()) {
+      if (otherCar === car || otherCar.crashed) continue
+
+      const otherProgress = getTrackProgress(this.track.points, otherCar.sprite)
+      let progressDelta = otherProgress - carProgress
+      if (progressDelta <= 0) progressDelta += 1
+      const routeDistance = progressDelta * this.track.pathLength
+      if (routeDistance <= 0 || routeDistance > this.vehicleDetectionLength) continue
+
+      const gap = Math.max(0, routeDistance - this.racerCollisionRadius * 2)
+      if (!nearest || gap < nearest.distance) {
+        nearest = { distance: gap, speed: otherCar.speed, car: otherCar }
+      }
+    }
+
+    return nearest
+  }
+
+  getDesiredFollowingGap(followerSpeed, leaderSpeed = followerSpeed) {
+    const closingSpeed = Math.max(0, followerSpeed - leaderSpeed)
+    const closingDistance = closingSpeed * 1000 * this.vehicleClosingTime
+
+    return this.vehicleMinimumGap + closingDistance
+  }
+
+  updateTrafficCars(delta) {
+    for (const trafficCar of this.trafficCars) {
+      if (trafficCar.crashed) continue
+
+      const wallDetection = getWallDistanceAhead(
+        this.track.points,
+        trafficCar.sprite,
+        trafficCar.heading,
+        this.laserLength,
+        this.roadWidth / 2,
+        this.racerCollisionRadius,
+      )
+      const clearanceDetection = getCornerClearanceDetection(
+        this.track.points,
+        trafficCar.sprite,
+        trafficCar.heading,
+        this.roadWidth / 2,
+        this.cornerSensorRadius,
+        this.cornerSensorForwardOffset,
+        this.cornerSensorLateralOffset,
+      )
+      const vehicleAhead = this.getVehicleAhead(trafficCar)
+      const followingGap = vehicleAhead
+        ? this.getDesiredFollowingGap(trafficCar.speed, vehicleAhead.speed)
+        : this.vehicleMinimumGap
+      const safeSpeed = this.getSafeSpeed(
+        wallDetection,
+        vehicleAhead,
+        trafficCar.cruiseSpeed,
+        trafficCar.speed,
+      )
+      const isBraking = trafficCar.speed > safeSpeed
+      const responseRate = isBraking
+        ? this.brakingResponseRate * this.brakeForceScale
+        : this.accelerationResponseRate
+      const response = 1 - Math.exp(-responseRate * delta)
+      trafficCar.speed = Phaser.Math.Linear(trafficCar.speed, safeSpeed, response)
+
+      const steeringBias = this.getSteeringBias(clearanceDetection, trafficCar.steeringCommand)
+      const steeringDirectionChanged = steeringBias !== 0
+        && trafficCar.steeringCommand !== 0
+        && Math.sign(steeringBias) !== Math.sign(trafficCar.steeringCommand)
+      trafficCar.steeringCommand = steeringDirectionChanged
+        ? steeringBias
+        : Phaser.Math.Linear(trafficCar.steeringCommand, steeringBias, Math.min(delta / 100, 1))
+      trafficCar.heading += trafficCar.steeringCommand * this.steeringRate * delta
+
+      const distance = trafficCar.speed * delta
+      const travelDistance = vehicleAhead
+        ? Math.min(distance, Math.max(0, vehicleAhead.distance - followingGap))
+        : distance
+      trafficCar.sprite.x += Math.cos(trafficCar.heading) * travelDistance
+      trafficCar.sprite.y += Math.sin(trafficCar.heading) * travelDistance
+      trafficCar.sprite.setRotation(trafficCar.heading)
+
+      const wallDistance = this.roadWidth / 2 - this.racerCollisionRadius
+      if (getDistanceToTrack(this.track.points, trafficCar.sprite) > wallDistance) {
+        trafficCar.crashed = true
+        trafficCar.speed = 0
+        trafficCar.sprite.setAlpha(0.4)
+      }
+
+      this.updateTrafficSensorGraphics(trafficCar, wallDetection, clearanceDetection, vehicleAhead)
+    }
+  }
+
+  updateTrafficSensorGraphics(trafficCar, wallDetection, clearanceDetection, vehicleAhead) {
+    const graphics = trafficCar.sensorGraphics
+    const directionX = Math.cos(trafficCar.heading)
+    const directionY = Math.sin(trafficCar.heading)
+    const sensorStart = this.racerCollisionRadius
+    const sensorEnd = sensorStart + this.laserLength
+    const laserColor = wallDetection ? 0xe9674e : 0x65b8e8
+
+    graphics.clear()
+    graphics.lineStyle(1.5, laserColor, 0.55)
+    graphics.lineBetween(
+      trafficCar.sprite.x + directionX * sensorStart,
+      trafficCar.sprite.y + directionY * sensorStart,
+      trafficCar.sprite.x + directionX * sensorEnd,
+      trafficCar.sprite.y + directionY * sensorEnd,
+    )
+
+    const sensors = [
+      { sensor: clearanceDetection.left, color: 0x4aa3df },
+      { sensor: clearanceDetection.right, color: 0xb66be8 },
+    ]
+    for (const { sensor, color } of sensors) {
+      graphics.lineStyle(1.5, color, 0.7)
+      graphics.lineBetween(sensor.center.x, sensor.center.y, sensor.point.x, sensor.point.y)
+      this.drawSensorAngle(graphics, sensor, color, trafficCar.heading)
+    }
+
+    if (vehicleAhead) {
+      graphics.lineStyle(1.5, 0x65b8e8, 0.8)
+      graphics.lineBetween(
+        trafficCar.sprite.x + directionX * sensorStart,
+        trafficCar.sprite.y + directionY * sensorStart,
+        vehicleAhead.car.sprite.x,
+        vehicleAhead.car.sprite.y,
+      )
+      graphics.fillStyle(0x65b8e8, 0.85)
+      graphics.fillCircle(vehicleAhead.car.sprite.x, vehicleAhead.car.sprite.y, 3)
+    }
+  }
+
   updateCornerSensorLines(clearanceDetection) {
     if (!this.cornerSensorGraphics) return
 
@@ -730,14 +1041,14 @@ class RaceTrackScene extends Phaser.Scene {
     }
   }
 
-  drawSensorAngle(graphics, sensor, color) {
+  drawSensorAngle(graphics, sensor, color, heading = this.racerHeading) {
     const arcRadius = 28
     const steps = Math.max(4, Math.ceil(Math.abs(sensor.angle) * 12))
 
     graphics.lineStyle(2, color, 0.95)
     graphics.beginPath()
     for (let step = 0; step <= steps; step += 1) {
-      const angle = this.racerHeading + sensor.angle * step / steps
+      const angle = heading + sensor.angle * step / steps
       const x = sensor.center.x + Math.cos(angle) * arcRadius
       const y = sensor.center.y + Math.sin(angle) * arcRadius
       if (step === 0) graphics.moveTo(x, y)
@@ -746,7 +1057,7 @@ class RaceTrackScene extends Phaser.Scene {
     graphics.strokePath()
   }
 
-  updateSteering(clearanceDetection, delta) {
+  getSteeringBias(clearanceDetection, previousSteeringCommand = 0) {
     const leftClearance = clearanceDetection.left.clearance
     const rightClearance = clearanceDetection.right.clearance
     const clearanceBias = Phaser.Math.Clamp(
@@ -771,14 +1082,19 @@ class RaceTrackScene extends Phaser.Scene {
       ? 1
       : leftClearance > rightClearance
         ? -1
-        : this.steeringCommand !== 0 ? Math.sign(this.steeringCommand) : 1
+        : previousSteeringCommand !== 0 ? Math.sign(previousSteeringCommand) : 1
     const emergencySteering = clearanceEscapeDirection * emergencyUrgency * 0.45
-    let steeringBias = Phaser.Math.Clamp(
+    const steeringBias = Phaser.Math.Clamp(
       clearanceBias * 0.65 + angleBias * 0.35 + emergencySteering,
       -1,
       1,
     )
-    steeringBias = Phaser.Math.Clamp(steeringBias * this.steeringCorrectionScale, -1, 1)
+
+    return Phaser.Math.Clamp(steeringBias * this.steeringCorrectionScale, -1, 1)
+  }
+
+  updateSteering(clearanceDetection, delta) {
+    const steeringBias = this.getSteeringBias(clearanceDetection, this.steeringCommand)
 
     const steeringDirectionChanged = steeringBias !== 0
       && this.steeringCommand !== 0
@@ -813,22 +1129,40 @@ class RaceTrackScene extends Phaser.Scene {
     )
   }
 
-  getSafeSpeed(wallDetection) {
-    if (!wallDetection) return this.cruiseSpeed
+  getSafeSpeed(
+    wallDetection,
+    vehicleAhead = null,
+    cruiseSpeed = this.cruiseSpeed,
+    followerSpeed = cruiseSpeed,
+  ) {
+    let safeSpeed = cruiseSpeed
 
-    if (wallDetection.distance <= this.brakingDistance) {
+    if (wallDetection && wallDetection.distance <= this.brakingDistance) {
       const distanceRatio = Phaser.Math.Clamp(wallDetection.distance / this.brakingDistance, 0, 1)
-      return this.cruiseSpeed * Math.sqrt(distanceRatio)
+      safeSpeed = cruiseSpeed * Math.sqrt(distanceRatio)
+    } else if (wallDetection) {
+      const anticipationRange = Math.max(this.laserLength - this.brakingDistance, 1)
+      const anticipationRatio = Phaser.Math.Clamp(
+        (wallDetection.distance - this.brakingDistance) / anticipationRange,
+        0,
+        1,
+      )
+      const anticipationReduction = 0.08 * anticipationRatio * anticipationRatio
+      safeSpeed = cruiseSpeed * (1 - anticipationReduction)
     }
 
-    const anticipationRange = Math.max(this.laserLength - this.brakingDistance, 1)
-    const anticipationRatio = Phaser.Math.Clamp(
-      (wallDetection.distance - this.brakingDistance) / anticipationRange,
-      0,
-      1,
-    )
-    const anticipationReduction = 0.08 * anticipationRatio * anticipationRatio
-    return this.cruiseSpeed * (1 - anticipationReduction)
+    if (vehicleAhead) {
+      const followingGap = this.getDesiredFollowingGap(followerSpeed, vehicleAhead.speed)
+      const gapError = vehicleAhead.distance - followingGap
+      const vehicleSafeSpeed = Phaser.Math.Clamp(
+        vehicleAhead.speed + gapError / 1000,
+        0,
+        cruiseSpeed,
+      )
+      safeSpeed = Math.min(safeSpeed, vehicleSafeSpeed)
+    }
+
+    return safeSpeed
   }
 
   getVelocityKph() {
@@ -934,6 +1268,14 @@ class RaceTrackScene extends Phaser.Scene {
     context.moveTo(car.x, car.y)
     context.lineTo(car.x + Math.cos(this.racerHeading) * 9, car.y + Math.sin(this.racerHeading) * 9)
     context.stroke()
+
+    for (const trafficCar of this.trafficCars) {
+      const trafficPosition = mapPoint(trafficCar.sprite)
+      context.fillStyle = trafficCar.crashed ? '#53605b' : '#65b8e8'
+      context.beginPath()
+      context.arc(trafficPosition.x, trafficPosition.y, 3, 0, TAU)
+      context.fill()
+    }
   }
 
   updateLaser(wallDetection) {
@@ -992,7 +1334,27 @@ class RaceTrackScene extends Phaser.Scene {
     this.maxSpeedKph = Phaser.Math.Clamp(Number(speed), 20, MAX_SPEED_LIMIT_KPH)
     this.cruiseSpeed = this.maxSpeedKph * this.speedPerKph
     this.driveSpeed = Math.min(this.driveSpeed, this.cruiseSpeed)
+    for (const trafficCar of this.trafficCars) {
+      trafficCar.cruiseSpeed = this.cruiseSpeed * trafficCar.speedFactor
+      trafficCar.speed = Math.min(trafficCar.speed, trafficCar.cruiseSpeed)
+    }
     document.querySelector('#max-speed-value').textContent = this.maxSpeedKph.toString().padStart(3, '0')
+  }
+
+  setTotalCarCount(totalCars) {
+    const clampedTotalCars = Phaser.Math.Clamp(Number(totalCars), 1, 20)
+    this.trafficCarCount = clampedTotalCars - 1
+    document.querySelector('#car-count-slider-value').textContent = clampedTotalCars.toString().padStart(2, '0')
+
+    if (this.track && this.racer) {
+      this.rebuildTrafficCars()
+      this.updateReadout()
+    }
+  }
+
+  setFollowingGap(gap) {
+    this.vehicleMinimumGap = Phaser.Math.Clamp(Number(gap), 20, 160)
+    document.querySelector('#following-gap-value').textContent = this.vehicleMinimumGap.toString().padStart(3, '0')
   }
 
   setBrakeForceScale(scale) {
@@ -1007,6 +1369,8 @@ class RaceTrackScene extends Phaser.Scene {
 
   resetControls() {
     this.setMaxSpeed(64)
+    this.setTotalCarCount(3)
+    this.setFollowingGap(46)
     this.setLaserLength(240)
     this.setBrakeForceScale(100)
     this.setSteeringCorrectionScale(100)
@@ -1021,6 +1385,7 @@ class RaceTrackScene extends Phaser.Scene {
     document.querySelector('#telemetry-speed').style.width = '0%'
     this.updateLaser({ distance: 0 })
     this.updateSensorReadout({ distance: 0, side: 'FRONT' })
+    this.updateVehicleSensor(null)
 
     const sparks = this.add.graphics()
     sparks.lineStyle(3, 0xe9674e, 0.95)
@@ -1058,12 +1423,18 @@ class RaceTrackScene extends Phaser.Scene {
     document.querySelector('#track-id').textContent = this.track.id
     document.querySelector('#anchor-count').textContent = this.track.turnCount.toString().padStart(2, '0')
     document.querySelector('#track-length').textContent = this.track.length.toString().padStart(3, '0')
+    document.querySelector('#car-count').textContent = (this.trafficCars.length + 1).toString().padStart(2, '0')
+    document.querySelector('#car-count').textContent = (this.trafficCars.length + 1).toString().padStart(2, '0')
     document.querySelector('#velocity-readout').textContent = this.getVelocityKph().toString().padStart(3, '0')
     document.querySelector('#heading-readout').textContent = Math.round(Phaser.Math.RadToDeg(this.racerHeading + TAU) % 360).toString().padStart(3, '0')
     document.querySelector('#telemetry-state').textContent = 'LIVE'
     document.querySelector('#telemetry-speed').style.width = `${Math.min(this.getVelocityKph() / MAX_SPEED_LIMIT_KPH * 100, 100)}%`
     document.querySelector('#max-speed').value = this.maxSpeedKph.toString()
     document.querySelector('#max-speed-value').textContent = this.maxSpeedKph.toString().padStart(3, '0')
+    document.querySelector('#car-count-slider').value = (this.trafficCars.length + 1).toString()
+    document.querySelector('#car-count-slider-value').textContent = (this.trafficCars.length + 1).toString().padStart(2, '0')
+    document.querySelector('#following-gap').value = this.vehicleMinimumGap.toString()
+    document.querySelector('#following-gap-value').textContent = this.vehicleMinimumGap.toString().padStart(3, '0')
     document.querySelector('#laser-range').value = this.laserLength.toString()
     document.querySelector('#laser-length-value').textContent = this.laserLength.toString()
     document.querySelector('#brake-force').value = Math.round(this.brakeForceScale * 100).toString()
@@ -1077,6 +1448,7 @@ class RaceTrackScene extends Phaser.Scene {
     this.updateCornerSensorLines(clearanceDetection)
     this.updateClearanceReadout(clearanceDetection)
     this.updateSensorReadout(wallDetection)
+    this.updateVehicleSensor(this.getVehicleAhead(this.getPlayerCarState()))
   }
 }
 
@@ -1102,6 +1474,14 @@ document.querySelector('#generate-track').addEventListener('click', () => {
 
 document.querySelector('#max-speed').addEventListener('input', (event) => {
   game.scene.getScene('RaceTrackScene').setMaxSpeed(event.target.value)
+})
+
+document.querySelector('#car-count-slider').addEventListener('input', (event) => {
+  game.scene.getScene('RaceTrackScene').setTotalCarCount(event.target.value)
+})
+
+document.querySelector('#following-gap').addEventListener('input', (event) => {
+  game.scene.getScene('RaceTrackScene').setFollowingGap(event.target.value)
 })
 
 document.querySelector('#replay-track').addEventListener('click', () => {

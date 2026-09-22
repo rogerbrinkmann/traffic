@@ -94,15 +94,16 @@
   .minimap-panel canvas { display: block; width: 100%; height: auto; aspect-ratio: 11 / 7; border: 1px solid rgba(194, 211, 194, 0.16); }
   .readout { position: absolute; z-index: 30; top: 57px; right: 14px; width: 238px; max-height: calc(100% - 71px); overflow-y: auto; border: 1px solid rgba(194, 211, 194, 0.35); background: rgba(13, 21, 21, 0.9); box-shadow: 0 16px 36px rgba(0, 0, 0, 0.28); backdrop-filter: blur(8px); }
   .readout-block { padding: 22px 18px; border-bottom: 1px solid var(--line); }
-  .readout-primary .eyebrow { margin-bottom: 9px; }
-  .track-id { color: var(--acid); font: 400 46px/0.95 var(--display); letter-spacing: 0.08em; }
-  .readout-caption { margin-top: 10px; color: #6c8378; font-size: 9px; }
+  .readout-primary { padding: 10px 12px; }
+  .readout-primary .eyebrow { margin-bottom: 4px; }
+  .track-id { color: var(--acid); font: 400 24px/0.95 var(--display); letter-spacing: 0.08em; }
+  .readout-caption { margin-top: 4px; color: #6c8378; font-size: 7px; }
   .readout-grid { display: grid; grid-template-columns: 1fr 1fr; border-bottom: 1px solid var(--line); }
-  .metric { min-height: 87px; padding: 15px 13px; border-right: 1px solid var(--line); border-bottom: 1px solid var(--line); }
+  .metric { min-height: 48px; padding: 6px 8px; border-right: 1px solid var(--line); border-bottom: 1px solid var(--line); }
   .metric:nth-child(2n) { border-right: 0; }
   .metric:nth-child(3), .metric:nth-child(4) { border-bottom: 0; }
-  .metric-label { display: block; margin-bottom: 11px; color: #71887d; font-size: 8px; letter-spacing: 0.12em; }
-  .metric strong { color: var(--paper); font: 400 27px/1 var(--display); letter-spacing: 0.04em; }
+  .metric-label { display: block; margin-bottom: 3px; color: #71887d; font-size: 6px; letter-spacing: 0.12em; }
+  .metric strong { color: var(--paper); font: 400 18px/1 var(--display); letter-spacing: 0.04em; }
   .metric small, .telemetry-row small { margin-left: 4px; color: #6d867a; font-size: 8px; }
   .telemetry { border-bottom: 0; }
   .telemetry-head { display: flex; justify-content: space-between; margin-bottom: 20px; color: #829a8e; font-size: 9px; letter-spacing: 0.1em; }
@@ -120,6 +121,7 @@
   .sensor-controls { border-top: 1px solid var(--line); }
   .sensor-controls .telemetry-head { margin-bottom: 15px; }
   .clearance-readout { margin-top: 18px; margin-bottom: 0; }
+  .vehicle-gap-readout { margin-top: 14px; margin-bottom: 0; }
   .slider-label { display: flex; align-items: baseline; color: #6f897c; font-size: 8px; letter-spacing: 0.1em; }
   .slider-label output { margin-left: auto; color: var(--paper); font: 400 21px/1 var(--display); letter-spacing: 0.05em; }
   .slider-label small { margin-left: 4px; color: #6d867a; font-size: 8px; }
@@ -133,6 +135,5 @@
   .reset-controls { display: inline-flex; align-items: center; justify-content: center; gap: 8px; width: 100%; margin-top: 18px; padding: 9px 10px 8px; border: 1px solid rgba(194, 211, 194, 0.35); border-radius: 0; color: var(--paper); background: transparent; font-size: 9px; letter-spacing: 0.1em; }
   .reset-controls:hover { border-color: var(--acid); background: rgba(232, 226, 166, 0.08); }
   .reset-controls:focus-visible { outline: 2px solid var(--coral); outline-offset: 3px; }
-  .readout-footnote { padding: 18px; color: #526b60; font-size: 8px; line-height: 1.8; letter-spacing: 0.08em; }
 
 
